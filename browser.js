@@ -32,18 +32,37 @@ let activeTabs = 0;
 let chromeProcess = null; // set only when this process owns Chrome's lifetime
 
 function findChrome() {
-    if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+    if (process.env.CHROME_PATH) {
+        if (fs.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH;
+        throw new Error(`Google Chrome not found at CHROME_PATH=${process.env.CHROME_PATH}. Fix the path in .env or leave it empty to auto-detect`);
+    }
     const candidates = {
         win32: [
             'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
             'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
             path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe'),
         ],
-        linux: ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/opt/google/chrome/chrome'],
+        linux: [
+            '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/opt/google/chrome/chrome',
+            // Fallbacks if only Chromium is installed (real Google Chrome is preferred)
+            '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium',
+        ],
         darwin: ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'],
     }[process.platform] || [];
+    // Also look anywhere on PATH (e.g. installed to /usr/local/bin)
+    if (process.platform !== 'win32') {
+        const names = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
+        for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+            for (const n of names) candidates.push(path.join(dir, n));
+        }
+    }
     const found = candidates.find(p => p && fs.existsSync(p));
-    if (!found) throw new Error('Google Chrome not found. Install Chrome or set CHROME_PATH in .env');
+    if (!found) {
+        const hint = process.platform === 'linux'
+            ? ' (Ubuntu/Debian: wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && sudo apt install -y ./google-chrome-stable_current_amd64.deb)'
+            : '';
+        throw new Error(`Google Chrome not found. Install Chrome or set CHROME_PATH in .env${hint}`);
+    }
     return found;
 }
 
