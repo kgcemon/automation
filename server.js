@@ -1,125 +1,173 @@
-const express = require("express");
-const rateLimit = require('express-rate-limit');
-const { v4: uuidv4 } = require('uuid');
-const { paymentLink } = require("./paymentLink");
-const { runAutomation } = require("./topup");
-const { addTransaction, updateTransaction, findTransaction } = require("./database");
-const axios = require("axios");
 require('dotenv').config();
+const express = require('express');
+const rateLimit = require('express-rate-limit');
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
+const log = require('./logger');
+const { withPage, getBrowser, closeBrowser } = require('./browser');
+const { createPaymentLink } = require('./paymentLink');
+const { redeemVoucher } = require('./topup');
+const { addTransaction, updateTransaction, findTransaction } = require('./database');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 6 * 60 * 1000); // includes captcha wait
+const JOB_GAP_MS = Number(process.env.JOB_GAP_MS || 1500);                   // pause between jobs, be gentle with the site
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 50);
 
-app.use(express.json());
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '20kb' }));
 
 const limiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 5,
-    message: { status: false, message: "Too many requests, please try again later." }
+    max: Number(process.env.RATE_LIMIT_PER_MIN || 5),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { status: false, message: 'Too many requests, please try again later.' },
 });
 
-let transactionRunning = false;
+// ---------- Job queue: one Chrome job at a time, in arrival order ----------
+const queue = [];
+let running = false;
+let stats = { done: 0, failed: 0, current: null };
+
+function enqueue(job) {
+    queue.push(job);
+    drain();
+}
+
+async function drain() {
+    if (running) return;
+    running = true;
+    while (queue.length) {
+        const job = queue.shift();
+        stats.current = job.uid;
+        try {
+            await runJob(job);
+        } catch (e) {
+            log.error(`Job ${job.uid} crashed:`, e);
+        }
+        stats.current = null;
+        if (queue.length) await new Promise(r => setTimeout(r, JOB_GAP_MS));
+    }
+    running = false;
+}
+
+function withTimeout(promise, ms) {
+    let t;
+    return Promise.race([
+        promise,
+        new Promise((_, rej) => { t = setTimeout(() => rej(Object.assign(new Error('Job timed out'), { code: 'TIMEOUT' })), ms); }),
+    ]).finally(() => clearTimeout(t));
+}
+
+async function runJob(job) {
+    const started = Date.now();
+    log.info(`Job ${job.uid} start player=${job.playerId} denom=${job.denom}`);
+    try {
+        const result = await withTimeout(withPage(async page => {
+            const link = await createPaymentLink(page, job.playerId, job.shopOptions);
+            const { resultUrl } = await redeemVoucher(page, link.url, job);
+            return { nickname: link.nickname, resultUrl };
+        }), JOB_TIMEOUT_MS);
+
+        stats.done++;
+        log.info(`Job ${job.uid} success in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        await finish(job, { status: true, message: 'Transaction successful', extra: result.resultUrl, nickname: result.nickname });
+    } catch (e) {
+        stats.failed++;
+        const known = e.code && e.code !== 'TIMEOUT';
+        log.error(`Job ${job.uid} failed [${e.code || 'ERR'}]: ${e.message}`);
+        await finish(job, {
+            status: false,
+            message: known ? e.message : (e.code === 'TIMEOUT' ? 'Transaction timed out' : 'Transaction Failed'),
+            code: e.code || 'ERROR',
+        });
+        // A timeout can leave Chrome in a bad state; start fresh next time
+        if (e.code === 'TIMEOUT') await closeBrowser();
+    }
+}
+
+async function finish(job, payload) {
+    payload.uid = job.uid;
+    try {
+        await updateTransaction(job.uid, payload.status ? 'success' : 'failed', payload.message, payload.extra ?? null);
+    } catch (e) {
+        log.error(`Failed to update transaction ${job.uid}: ${e}`);
+    }
+    for (let i = 1; i <= 3; i++) {
+        try {
+            await axios.post(job.webhook, payload, { timeout: 10000 });
+            return;
+        } catch (e) {
+            log.warn(`Webhook attempt ${i} failed for ${job.uid}: ${e.message}`);
+            await new Promise(r => setTimeout(r, i * 2000));
+        }
+    }
+}
+
+// ---------- Routes ----------
+const isUrl = s => typeof s === 'string' && /^https?:\/\//.test(s);
+
+app.post('/topup', limiter, async (req, res) => {
+    const { playerId, denom, type, voucherCode, webhook,
+            appId, channelId, shopRegion, playerRegion, paymentSelector } = req.body || {};
+
+    const denomIndex = Number(denom);
+    if (!/^[A-Za-z0-9_-]{3,30}$/.test(String(playerId || '')) || !Number.isInteger(denomIndex) || denomIndex < 0
+        || !voucherCode || typeof voucherCode !== 'string' || !isUrl(webhook)) {
+        return res.status(400).json({ status: false, message: 'Invalid request parameters' });
+    }
+    if (queue.length >= MAX_QUEUE) {
+        return res.status(503).json({ status: false, message: 'Server busy, please try again later.' });
+    }
+
+    const uid = uuidv4();
+    try {
+        await addTransaction(uid, 'processing', 'Transaction set to Processing');
+    } catch (e) {
+        log.error(`Failed to add transaction: ${e}`);
+        return res.status(500).json({ status: false, message: 'Failed to start transaction' });
+    }
+
+    enqueue({
+        uid, playerId: String(playerId), denom: denomIndex, type, voucherCode: voucherCode.trim(), webhook, paymentSelector,
+        shopOptions: { appId, channelId, shopRegion, playerRegion },
+    });
+    res.status(200).json({ status: true, message: 'Transaction set to Processing', uid, position: queue.length });
+});
 
 app.get('/transactions/:uid', async (req, res) => {
-    const { uid } = req.params;
-
     try {
-        if (!uid) {
-            return res.status(400).json({ status: false, message: 'transaction uid is required' });
-        }
-        const transactionData = await findTransaction(uid);
-        if (!transactionData) {
-            return res.status(400).json({ status: false, message: 'Invalid transaction uid' });
-        }
-
-        res.status(200).json(transactionData);
-    } catch (error) {
-        console.error('Error handling transaction find request:', error);
+        const row = await findTransaction(req.params.uid);
+        if (!row) return res.status(400).json({ status: false, message: 'Invalid transaction uid' });
+        res.status(200).json(row);
+    } catch (e) {
+        log.error('Transaction lookup failed:', e);
         res.status(500).json({ status: false, message: 'Internal server error' });
     }
 });
 
-app.post("/topup", limiter, async (req, res) => {
-    const { playerId, denom, type, voucherCode, webhook,
-            appId, channelId, shopRegion, playerRegion, paymentSelector } = req.body;
-
-    const denomIndex = Number(denom);
-    if (!playerId || !Number.isInteger(denomIndex) || denomIndex < 0 || !voucherCode || !webhook || !isLinkValid(webhook)) {
-        return res.status(400).json({ status: false, message: 'Invalid request parameters' });
-    }
-
-    const uid = uuidv4();
-
-    try {
-        await addTransaction(uid, "processing", "Transaction set to Processing");
-    } catch (error) {
-        console.error(`Failed to add transaction: ${error}`);
-        return res.status(500).json({ status: false, message: 'Failed to start transaction' });
-    }
-
-    res.status(200).json({ status: true, message: 'Transaction set to Processing', uid: uid });
-
-    try {
-        while (transactionRunning) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-
-        transactionRunning = true;
-
-        const link = await paymentLink(playerId, { appId, channelId, shopRegion, playerRegion });
-
-        if (!isLinkValid(link)) {
-            await notifyWebhook(webhook, uid, { status: false, message: link || 'Invalid Player ID' });
-            return;
-        }
-
-        await runAutomation(link, denomIndex, type, voucherCode, paymentSelector, async (error, result) => {
-            if (error) {
-                await notifyWebhook(webhook, uid, { status: false, message: error.message });
-            } else {
-                await notifyWebhook(webhook, uid, { status: true, message: "Transaction successful", extra: result.message });
-            }
-        });
-    } catch (error) {
-        console.error('Error processing top-up:', error);
-        await notifyWebhook(webhook, uid, { status: false, message: error.message });
-    } finally {
-        transactionRunning = false;
-    }
+app.get('/health', (req, res) => {
+    res.json({ status: true, queue: queue.length, running, ...stats, uptime: Math.round(process.uptime()) });
 });
 
-function isLinkValid(link) {
-    return /^https?:\/\//.test(link);
-}
-
-async function notifyWebhook(url, uid, payload) {
-    if (!url) return;
-
-    payload.uid = uid;
-
-    const status = payload.status ? 'success' : 'failed';
-
-    try {
-        await updateTransaction(payload.uid, status, payload.message, payload.extra ?? null);
-    } catch (error) {
-        console.error(`Failed to update transaction: ${error}`);
-    }
-
-    try {
-        await axios.post(url, payload);
-    } catch (error) {
-        console.error(`Failed to notify webhook: ${error.message}`);
-    }
-}
-
-
-app.get("/", (req, res) => {
-    res.redirect('/');
-});
+app.get('/', (req, res) => res.json({ status: true, service: 'topup-automation' }));
 
 require('./cron');
 
-app.listen(PORT, () => {
-    console.log(`Listening on port ${PORT}`);
+const server = app.listen(PORT, () => {
+    log.info(`Listening on port ${PORT}`);
+    // Warm up Chrome so the first order is fast
+    getBrowser().catch(e => log.error('Chrome failed to start:', e.message));
 });
 
+async function shutdown(signal) {
+    log.info(`${signal} received, shutting down`);
+    server.close();
+    await closeBrowser();
+    process.exit(0);
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('unhandledRejection', e => log.error('Unhandled rejection:', e));
