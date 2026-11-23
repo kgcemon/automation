@@ -1,4 +1,6 @@
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
@@ -14,6 +16,7 @@ const PORT = process.env.PORT || 4000;
 const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 6 * 60 * 1000); // includes captcha wait
 const JOB_GAP_MS = Number(process.env.JOB_GAP_MS || 1500);                   // pause between jobs, be gentle with the site
 const MAX_QUEUE = Number(process.env.MAX_QUEUE || 50);
+const LOG_DIR = path.resolve(process.env.LOG_DIR || './logs');
 
 app.set('trust proxy', 1);
 app.use(express.json({ limit: '20kb' }));
@@ -66,9 +69,14 @@ async function runJob(job) {
     log.info(`Job ${job.uid} start player=${job.playerId} denom=${job.denom}`);
     try {
         const result = await withTimeout(withPage(async page => {
-            const link = await createPaymentLink(page, job.playerId, job.shopOptions);
-            const { resultUrl } = await redeemVoucher(page, link.url, job);
-            return { nickname: link.nickname, resultUrl };
+            try {
+                const link = await createPaymentLink(page, job.playerId, job.shopOptions);
+                const { resultUrl } = await redeemVoucher(page, link.url, job);
+                return { nickname: link.nickname, resultUrl };
+            } catch (e) {
+                await saveFailureScreenshot(page, job.uid);
+                throw e;
+            }
         }), JOB_TIMEOUT_MS);
 
         stats.done++;
@@ -85,6 +93,19 @@ async function runJob(job) {
         });
         // A timeout can leave Chrome in a bad state; start fresh next time
         if (e.code === 'TIMEOUT') await closeBrowser();
+    }
+}
+
+// Screenshot of the tab when a job fails -> logs/fail-<uid>.png (kept: last 30)
+async function saveFailureScreenshot(page, uid) {
+    try {
+        fs.mkdirSync(LOG_DIR, { recursive: true });
+        await page.screenshot({ path: path.join(LOG_DIR, `fail-${uid}.png`) });
+        const shots = fs.readdirSync(LOG_DIR).filter(f => f.startsWith('fail-'))
+            .map(f => ({ f, t: fs.statSync(path.join(LOG_DIR, f)).mtimeMs })).sort((a, b) => b.t - a.t);
+        for (const { f } of shots.slice(30)) fs.unlinkSync(path.join(LOG_DIR, f));
+    } catch (e) {
+        log.warn(`Screenshot failed: ${e.message}`);
     }
 }
 

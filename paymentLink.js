@@ -42,8 +42,14 @@ async function alertOperator(event, data) {
         .catch(e => log.error('Alert webhook failed:', e.message));
 }
 
-async function openShop(page, opts) {
-    await page.goto(`${SHOP_ORIGIN}/?app=${opts.appId}&channel=${opts.channelId}`, { waitUntil: 'networkidle2' });
+async function openShop(page, opts, playerId) {
+    const res = await page.goto(`${SHOP_ORIGIN}/?app=${opts.appId}&channel=${opts.channelId}`, { waitUntil: 'networkidle2' });
+
+    // Whole page blocked by bot protection (not just the login call)
+    if (res?.status() === 403 || await page.$(CAPTCHA_FRAME)) {
+        await waitForHumanCaptcha(page, playerId);
+        await page.goto(`${SHOP_ORIGIN}/?app=${opts.appId}&channel=${opts.channelId}`, { waitUntil: 'networkidle2' });
+    }
 
     // Persistent profile: drop any player left over from the previous job
     if (!(await page.$(PLAYER_INPUT))) {
@@ -82,11 +88,19 @@ async function waitForHumanCaptcha(page, playerId) {
         await alertOperator('captcha_required', { playerId, note: 'Headless mode cannot show captcha. Run with HEADLESS=false.' });
         throw new ShopError('Shop asked for captcha verification. Please try again shortly.', 'CAPTCHA_REQUIRED');
     }
+    await sleep(1500);
+    // DataDome: t=fe is a captcha a human can solve, t=bv is a hard block ("Access is
+    // temporarily restricted") that nobody can solve - stop at once instead of waiting.
+    const frameSrc = await page.$eval(CAPTCHA_FRAME, f => f.src).catch(() => '');
+    if (/[?&]t=bv\b/.test(frameSrc)) {
+        await alertOperator('ip_blocked', { playerId, note: 'Shop temporarily blocked this IP. Pause orders and wait before retrying.' });
+        throw new ShopError('Shop is temporarily restricting access. Please try again later.', 'IP_BLOCKED');
+    }
+
     await alertOperator('captcha_required', { playerId, note: 'Solve the captcha in the Chrome window.' });
     await page.bringToFront().catch(() => {});
 
     const deadline = Date.now() + CAPTCHA_WAIT_MS;
-    await sleep(2000);
     while (Date.now() < deadline) {
         // The page may reload while the human solves it - ignore those moments
         const stillThere = await page.$(CAPTCHA_FRAME).then(Boolean).catch(() => true);
@@ -102,7 +116,7 @@ async function loginPlayer(page, playerId, opts) {
     if (login.status === 403 && login.data?.url?.includes('captcha')) {
         await waitForHumanCaptcha(page, playerId);
         await human(800, 1500);
-        await openShop(page, opts); // page state after a captcha is unknown - start the form fresh
+        await openShop(page, opts, playerId); // page state after a captcha is unknown - start the form fresh
         login = await submitPlayerId(page, playerId);
     }
     if (login.status !== 200) {
@@ -156,7 +170,7 @@ async function createPaymentLink(page, playerId, options = {}) {
     const opts = { ...DEFAULTS };
     for (const [k, v] of Object.entries(options)) if (v !== undefined && v !== null) opts[k] = v;
 
-    await openShop(page, opts);
+    await openShop(page, opts, playerId);
     const player = await loginPlayer(page, playerId, opts);
     log.info(`Logged in player ${playerId} (${player.nickname}, ${player.region})`);
 

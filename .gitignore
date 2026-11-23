@@ -4,3 +4,4 @@ database.db
 package-lock.json
 README.md
 /chrome-profile
+/logs

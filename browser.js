@@ -7,7 +7,7 @@
  * - Persistent profile (CHROME_PROFILE_DIR) so cookies / site trust survive restarts,
  *   and a human-solved captcha keeps working for later jobs
  * - Every job gets its own tab which is always closed afterwards
- * - Images / media / fonts are blocked to keep CPU, RAM and bandwidth low
+ * - Pages load normally (images included); BLOCK_ASSETS=true to save bandwidth
  * - A Chrome we own is recycled after BROWSER_MAX_JOBS jobs to avoid memory creep
  */
 const fs = require('fs');
@@ -19,7 +19,7 @@ const log = require('./logger');
 const HEADLESS = String(process.env.HEADLESS || 'false').toLowerCase() === 'true';
 const PROFILE_DIR = path.resolve(process.env.CHROME_PROFILE_DIR || './chrome-profile');
 const MAX_JOBS = Number(process.env.BROWSER_MAX_JOBS || 50);
-const BLOCK_ASSETS = String(process.env.BLOCK_ASSETS || 'true').toLowerCase() === 'true';
+const BLOCK_ASSETS = String(process.env.BLOCK_ASSETS || 'false').toLowerCase() === 'true';
 const BLOCKED_TYPES = new Set(['image', 'media', 'font']);
 const DEBUG_URL = process.env.CHROME_DEBUG_URL || 'http://127.0.0.1:9222';
 // true = Chrome keeps running when the server stops/restarts (cookies & trust stay warm)
@@ -61,8 +61,31 @@ async function tryConnect() {
  * exactly what makes the shop ask for verification. We then just attach over the
  * DevTools port, the same way as attaching to your own Chrome.
  */
+/**
+ * Linux VPS has no screen. A visible Chrome needs one, so start a long-lived
+ * virtual screen (Xvfb) that outlives this process, just like Chrome does.
+ * Connect a VNC viewer to it (x11vnc -display :99) to solve a captcha by hand.
+ */
+function ensureDisplay() {
+    if (process.platform !== 'linux' || HEADLESS || process.env.DISPLAY) return;
+    const display = process.env.XVFB_DISPLAY || ':99';
+    if (!fs.existsSync(`/tmp/.X11-unix/X${display.slice(1)}`)) {
+        log.info(`No DISPLAY - starting Xvfb on ${display}`);
+        try {
+            spawn('Xvfb', [display, '-screen', '0', '1280x900x24', '-nolisten', 'tcp'], { detached: true, stdio: 'ignore' })
+                .on('error', e => log.error(`Xvfb failed (apt install xvfb): ${e.message}`))
+                .unref();
+        } catch (e) {
+            log.error(`Xvfb failed (apt install xvfb): ${e.message}`);
+        }
+    }
+    process.env.DISPLAY = display;
+}
+
 async function startChrome() {
     const executablePath = findChrome();
+    ensureDisplay();
+    if (process.platform === 'linux' && !HEADLESS) await new Promise(r => setTimeout(r, 1000));
     const port = new URL(DEBUG_URL).port || '9222';
     log.info(`Starting Chrome (${HEADLESS ? 'headless' : 'visible'}) profile=${PROFILE_DIR} port=${port}`);
     const child = spawn(executablePath, [
