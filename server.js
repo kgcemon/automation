@@ -67,14 +67,19 @@ function withTimeout(promise, ms) {
 async function runJob(job) {
     const started = Date.now();
     log.info(`Job ${job.uid} start player=${job.playerId} denom=${job.denom}`);
+    const ctx = { step: 'start_chrome', pageUrl: null, screenshot: null, nickname: null };
     try {
         const result = await withTimeout(withPage(async page => {
             try {
+                ctx.step = 'shop_login';
                 const link = await createPaymentLink(page, job.playerId, job.shopOptions);
+                ctx.nickname = link.nickname;
+                ctx.step = 'unipin_voucher';
                 const { resultUrl } = await redeemVoucher(page, link.url, job);
                 return { nickname: link.nickname, resultUrl };
             } catch (e) {
-                await saveFailureScreenshot(page, job.uid);
+                ctx.pageUrl = page.url();
+                ctx.screenshot = await saveFailureScreenshot(page, job.uid);
                 throw e;
             }
         }), JOB_TIMEOUT_MS);
@@ -84,35 +89,80 @@ async function runJob(job) {
         await finish(job, { status: true, message: 'Transaction successful', extra: result.resultUrl, nickname: result.nickname });
     } catch (e) {
         stats.failed++;
-        const known = e.code && e.code !== 'TIMEOUT';
-        log.error(`Job ${job.uid} failed [${e.code || 'ERR'}]: ${e.message}`);
+        const { code, message } = describeError(e, ctx.step);
+        log.error(`Job ${job.uid} failed at ${ctx.step} [${code}]: ${e.message}`);
         await finish(job, {
             status: false,
-            message: known ? e.message : (e.code === 'TIMEOUT' ? 'Transaction timed out' : 'Transaction Failed'),
-            code: e.code || 'ERROR',
+            message,                       // readable reason
+            code,                          // machine-readable, e.g. INVALID_PLAYER, VOUCHER, IP_BLOCKED
+            step: ctx.step,                // start_chrome | shop_login | unipin_voucher
+            error: String(e.message || e), // raw error text
+            pageUrl: ctx.pageUrl,
+            screenshot: ctx.screenshot,    // file name in logs/ on the server
+            nickname: ctx.nickname,
+            durationMs: Date.now() - started,
         });
         // A timeout can leave Chrome in a bad state; start fresh next time
         if (e.code === 'TIMEOUT') await closeBrowser();
     }
 }
 
+const STEP_NAMES = {
+    start_chrome: 'Starting Chrome',
+    shop_login: 'Garena shop login',
+    unipin_voucher: 'UniPin voucher payment',
+};
+
+/**
+ * Turns any error into { code, message } that a person can understand.
+ * Our own errors (ShopError / TopupError) already have a clear message + code.
+ */
+function describeError(e, step) {
+    const where = STEP_NAMES[step] || step;
+    const raw = String(e?.message || e);
+
+    if (e?.code === 'TIMEOUT') return { code: 'TIMEOUT', message: `${where}: took too long (over ${Math.round(JOB_TIMEOUT_MS / 1000)}s)` };
+    if (e?.code && /^[A-Z_]+$/.test(e.code)) return { code: e.code, message: raw };
+
+    if (/Google Chrome not found/i.test(raw)) return { code: 'CHROME_NOT_FOUND', message: 'Google Chrome is not installed on the server (or set CHROME_PATH)' };
+    if (/DevTools port|ECONNREFUSED.*9222/i.test(raw)) return { code: 'CHROME_START_FAILED', message: `Chrome could not start: ${raw}` };
+    if (/Missing X server|cannot open display|DISPLAY/i.test(raw)) return { code: 'NO_DISPLAY', message: 'No screen for Chrome - install Xvfb (apt install xvfb)' };
+
+    const sel = raw.match(/[Ww]aiting for selector [`'"]?([^`'"]+)[`'"]? failed/);
+    if (sel) return { code: 'ELEMENT_NOT_FOUND', message: `${where}: element "${sel[1]}" did not appear (page changed or did not load)` };
+    if (/Navigation timeout|TimeoutError/i.test(raw)) return { code: 'PAGE_TIMEOUT', message: `${where}: page did not load in time` };
+    if (/net::ERR_/i.test(raw)) return { code: 'NETWORK', message: `${where}: network error (${raw.match(/net::ERR_[A-Z_]+/)[0]})` };
+    if (/Target closed|Session closed|detached|disconnected/i.test(raw)) return { code: 'BROWSER_CLOSED', message: `${where}: Chrome tab/window was closed` };
+    if (/Execution context was destroyed/i.test(raw)) return { code: 'PAGE_RELOADED', message: `${where}: page reloaded unexpectedly` };
+
+    return { code: 'ERROR', message: `${where}: ${raw}` };
+}
+
 // Screenshot of the tab when a job fails -> logs/fail-<uid>.png (kept: last 30)
 async function saveFailureScreenshot(page, uid) {
+    if (page.url() === 'about:blank') return null; // nothing loaded, nothing to show
     try {
         fs.mkdirSync(LOG_DIR, { recursive: true });
-        await page.screenshot({ path: path.join(LOG_DIR, `fail-${uid}.png`) });
+        const file = `fail-${uid}.png`;
+        await page.screenshot({ path: path.join(LOG_DIR, file) });
         const shots = fs.readdirSync(LOG_DIR).filter(f => f.startsWith('fail-'))
             .map(f => ({ f, t: fs.statSync(path.join(LOG_DIR, f)).mtimeMs })).sort((a, b) => b.t - a.t);
         for (const { f } of shots.slice(30)) fs.unlinkSync(path.join(LOG_DIR, f));
+        return file;
     } catch (e) {
         log.warn(`Screenshot failed: ${e.message}`);
+        return null;
     }
 }
 
 async function finish(job, payload) {
     payload.uid = job.uid;
     try {
-        await updateTransaction(job.uid, payload.status ? 'success' : 'failed', payload.message, payload.extra ?? null);
+        // Failed jobs keep the error details in `extra` so GET /transactions/:uid shows them too
+        const extra = payload.status
+            ? payload.extra ?? null
+            : JSON.stringify({ code: payload.code, step: payload.step, error: payload.error, pageUrl: payload.pageUrl, screenshot: payload.screenshot });
+        await updateTransaction(job.uid, payload.status ? 'success' : 'failed', payload.message, extra);
     } catch (e) {
         log.error(`Failed to update transaction ${job.uid}: ${e}`);
     }
