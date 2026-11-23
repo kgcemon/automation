@@ -1,86 +1,107 @@
 const axios = require('axios');
 const https = require('https');
-const agent = new https.Agent({
-    keepAlive: true,
-    rejectUnauthorized: false,
-    secureProtocol: 'TLSv1_2_method'
-});
+const crypto = require('crypto');
+const { getSession, invalidateSession, SHOP_ORIGIN } = require('./session');
 
-const paymentLink = async (playerId) => {
-    try {
-        const playerUrl = 'https://shop.garena.my/api/auth/player_id_login';
-        const playerPostFields = {
-            app_id: 202953,
-            login_id: playerId,
-            app_server_id: 0
-        };
-        const playerHeaders = {
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Cookie': 'source=pc; mspid2=23b79d8125f5d8ad091c745a0d28fc05; _ga=GA1.2.1526106606.1721112559; _gid=GA1.2.1406809970.1721112561; session_key=cs8kp6w6nasib8qle25wdk1m6or5dkb1; datadome=Bc4Ha7Y2fBB7r1VyGDE~SiYygDPqNUNAaiG8EUR9SnpNGPnQXwZbKX2_l9kaLEc1U3lacCioiJWECRAk5msKfT3jMOrgXwVnIskIwKkkdfiyyTCk4DqxGXyoN~nZFgAT; __csrf__=UZJ2gMIhHPMAOSnCpWIv9y1Ojlv0aYYs; _ga_76GMJR9HMM=GS1.1.1721112559.1.1.1721112624.0.0.0',
-            'DNT': '1',
-            'Origin': 'https://shop.garena.my',
-            'Pragma': 'no-cache',
-            'Referer': 'https://shop.garena.my/app',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0',
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'Sec-Fetch-User': '?1',
-            'Sec-GPC': '1',
-            'X-Requested-With': 'XMLHttpRequest',
-            'sec-ch-ua': '"Chromium";v="92", " Not A;Brand";v="99"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'x-datadome-clientid': 'Bc4Ha7Y2fBB7r1VyGDE~SiYygDPqNUNAaiG8EUR9SnpNGPnQXwZbKX2_l9kaLEc1U3lacCioiJWECRAk5msKfT3jMOrgXwVnIskIwKkkdfiyyTCk4DqxGXyoN~nZFgAT',
-        };
+const agent = new https.Agent({ keepAlive: true });
 
-        const playerResponse = await axios.post(playerUrl, playerPostFields, { headers: playerHeaders, httpsAgent: agent });
-        const playerData = playerResponse.data;
+// Defaults — every one can be overridden per request (see server.js) or via .env
+const DEFAULTS = {
+    appId: Number(process.env.APP_ID || 100067),
+    channelId: Number(process.env.CHANNEL_ID || 221179),
+    shopRegion: process.env.SHOP_REGION || 'MY',
+    playerRegion: process.env.PLAYER_REGION || 'BD', // set to '' to skip region check
+};
 
-        if (!playerData.nickname || playerData.region !== 'BD') {
-            return 'Invalid player ID';
-        }
+function mergeSetCookies(jar, response) {
+    for (const line of response.headers['set-cookie'] || []) {
+        const [pair] = line.split(';');
+        const idx = pair.indexOf('=');
+        if (idx > 0) jar[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
+    }
+}
 
-        const paymentUrl = 'https://shop.garena.my/api/shop/pay/init?language=en&region=MY';
-        const paymentPostFields = {
+function buildHeaders(session, jar, extra = {}) {
+    return {
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Content-Type': 'application/json',
+        'Cookie': Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; '),
+        'Origin': SHOP_ORIGIN,
+        'Referer': `${SHOP_ORIGIN}/app`,
+        'User-Agent': session.userAgent,
+        'X-Requested-With': 'XMLHttpRequest',
+        ...extra,
+    };
+}
+
+async function requestPaymentLink(playerId, opts, session) {
+    const jar = { ...session.cookies }; // per-request copy; login adds session_key/__csrf__
+    const playerRes = await axios.post(
+        `${SHOP_ORIGIN}/api/auth/player_id_login`,
+        { app_id: opts.appId, login_id: String(playerId), app_server_id: 0 },
+        { headers: buildHeaders(session, jar), httpsAgent: agent }
+    );
+    mergeSetCookies(jar, playerRes);
+    const player = playerRes.data;
+
+    if (!player.nickname) return { error: 'Invalid player ID' };
+    if (opts.playerRegion && player.region !== opts.playerRegion) {
+        return { error: `Player region ${player.region} not allowed` };
+    }
+
+    if (!jar.__csrf__) return { error: 'No __csrf__ cookie returned by player login' };
+
+    const payRes = await axios.post(
+        `${SHOP_ORIGIN}/api/shop/pay/init?language=en&region=${encodeURIComponent(opts.shopRegion)}`,
+        {
             service: 'pc',
-            app_id: 100067,
+            app_id: opts.appId,
             packed_role_id: 0,
-            channel_id: 221179,
-            channel_data: {
-                payment_channel: null,
-                need_return: true,
-                invoice: []
-            },
+            channel_id: opts.channelId,
+            channel_data: { payment_channel: null, need_return: true, invoice: [] },
             revamp_experiment: {
-                session_id: '7f99fd8d48e7aecb7cedaa4a204b305f',
+                session_id: crypto.randomBytes(16).toString('hex'),
                 group: 'control2',
                 service_version: 'payment_center_frontend_20240611',
                 source: 'pc',
-                domain: 'shop.garena.my'
+                domain: new URL(SHOP_ORIGIN).host,
+            },
+        },
+        { headers: buildHeaders(session, jar, { 'X-CSRF-Token': jar.__csrf__ }), httpsAgent: agent }
+    );
+
+    const url = payRes.data?.init?.url;
+    if (!url) return { error: 'Failed to initiate payment' };
+    return { url, nickname: player.nickname };
+}
+
+/**
+ * @param {string} playerId
+ * @param {{appId?:number, channelId?:number, shopRegion?:string, playerRegion?:string}} [options]
+ * @returns {Promise<string>} payment URL, or an error message string
+ */
+const paymentLink = async (playerId, options = {}) => {
+    const opts = { ...DEFAULTS };
+    for (const [k, v] of Object.entries(options)) {
+        if (v !== undefined && v !== null) opts[k] = v;
+    }
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            const session = await getSession({ forceRefresh: attempt > 1 });
+            const result = await requestPaymentLink(playerId, opts, session);
+            return result.url || result.error;
+        } catch (error) {
+            const status = error.response?.status;
+            console.error(`paymentLink attempt ${attempt} failed:`, status || '', error.message);
+            // Expired/blocked session -> refresh cookies once and retry
+            if (attempt === 1 && (status === 401 || status === 403 || status === 419)) {
+                invalidateSession();
+                continue;
             }
-        };
-        const paymentHeaders = {
-            ...playerHeaders,
-            'X-CSRF-Token': 'UZJ2gMIhHPMAOSnCpWIv9y1Ojlv0aYYs'
-        };
-
-        const paymentResponse = await axios.post(paymentUrl, paymentPostFields, { headers: paymentHeaders, httpsAgent: agent });
-        const paymentData = paymentResponse.data;
-
-        if (!paymentData.init || !paymentData.init.url) {
-            return 'Failed to initiate payment';
+            return error.message;
         }
-
-        return paymentData.init.url;
-
-    } catch (error) {
-        console.error('Error occurred:', error.message);
-        return error.message; // Re-throw the error to be caught by the caller
     }
 };
 

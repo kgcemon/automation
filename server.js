@@ -40,9 +40,11 @@ app.get('/transactions/:uid', async (req, res) => {
 });
 
 app.post("/topup", limiter, async (req, res) => {
-    const { playerId, denom, type, voucherCode, webhook } = req.body;
+    const { playerId, denom, type, voucherCode, webhook,
+            appId, channelId, shopRegion, playerRegion, paymentSelector } = req.body;
 
-    if (!playerId || !denom || !voucherCode || !webhook || !isLinkValid(webhook)) {
+    const denomIndex = Number(denom);
+    if (!playerId || !Number.isInteger(denomIndex) || denomIndex < 0 || !voucherCode || !webhook || !isLinkValid(webhook)) {
         return res.status(400).json({ status: false, message: 'Invalid request parameters' });
     }
 
@@ -64,14 +66,14 @@ app.post("/topup", limiter, async (req, res) => {
 
         transactionRunning = true;
 
-        const link = await paymentLink(playerId);
+        const link = await paymentLink(playerId, { appId, channelId, shopRegion, playerRegion });
 
         if (!isLinkValid(link)) {
-            await notifyWebhook(webhook, uid, { status: false, message: 'Invalid Player ID' });
+            await notifyWebhook(webhook, uid, { status: false, message: link || 'Invalid Player ID' });
             return;
         }
 
-        await runAutomation(link, denom, type, voucherCode, async (error, result) => {
+        await runAutomation(link, denomIndex, type, voucherCode, paymentSelector, async (error, result) => {
             if (error) {
                 await notifyWebhook(webhook, uid, { status: false, message: error.message });
             } else {

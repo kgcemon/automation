@@ -4,7 +4,12 @@ const { executablePath } = require('puppeteer');
 
 puppeteer.use(StealthPlugin());
 
-async function runAutomation(url, denom, type, voucherCode, callback) {
+const PAYMENT_SELECTORS = {
+    1: process.env.PAYMENT_SELECTOR_1 || '#pc_div_659',
+    2: process.env.PAYMENT_SELECTOR_2 || '#pc_div_670',
+};
+
+async function runAutomation(url, denom, type, voucherCode, paymentSelector, callback) {
     let browser;
     try {
         browser = await puppeteer.launch({
@@ -19,11 +24,10 @@ async function runAutomation(url, denom, type, voucherCode, callback) {
         // Wait for and select payment denomination
         await page.waitForSelector('.payment-denom-button');
         const buttons = await page.$$('.payment-denom-button');
-        if (buttons.length >= 10) {
-            await buttons[denom].click();
-        } else {
-            throw new Error('Payment denomination buttons not found.');
+        if (denom < 0 || denom >= buttons.length) {
+            throw new Error(`Denomination index ${denom} out of range (found ${buttons.length} options).`);
         }
+        await buttons[denom].click();
 
         await page.waitForNavigation();
 
@@ -33,7 +37,7 @@ async function runAutomation(url, denom, type, voucherCode, callback) {
         await page.click(expandBTN);
 
         // Select payment type
-        const typeBTN = type === 1 ? '#pc_div_659' : '#pc_div_670';
+        const typeBTN = paymentSelector || PAYMENT_SELECTORS[Number(type)] || PAYMENT_SELECTORS[2];
         await page.waitForSelector(typeBTN, { visible: true });
         await page.click(typeBTN);
 
