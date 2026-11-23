@@ -83,19 +83,34 @@ async function submitPlayerId(page, playerId) {
     return { status: res.status(), data };
 }
 
-async function waitForHumanCaptcha(page, playerId) {
+const isBlockUrl = url => /[?&]t=bv\b/.test(url || '');
+
+async function ipBlocked(playerId) {
+    await alertOperator('ip_blocked', { playerId, note: 'Shop temporarily blocked this IP. Pause orders and wait before retrying.' });
+    return new ShopError('Shop is temporarily restricting access from this server. Please try again later.', 'IP_BLOCKED');
+}
+
+/** True if the visible DataDome page is the "Access is temporarily restricted" block. */
+async function pageShowsBlock(page) {
+    for (const frame of page.frames()) {
+        if (!frame.url().includes('captcha-delivery.com')) continue;
+        if (isBlockUrl(frame.url())) return true;
+        const text = await frame.evaluate(() => document.body?.innerText || '').catch(() => '');
+        if (/temporarily restricted|unusual activity/i.test(text)) return true;
+    }
+    return false;
+}
+
+async function waitForHumanCaptcha(page, playerId, challengeUrl) {
+    if (isBlockUrl(challengeUrl)) throw await ipBlocked(playerId);
     if (HEADLESS) {
         await alertOperator('captcha_required', { playerId, note: 'Headless mode cannot show captcha. Run with HEADLESS=false.' });
         throw new ShopError('Shop asked for captcha verification. Please try again shortly.', 'CAPTCHA_REQUIRED');
     }
-    await sleep(1500);
     // DataDome: t=fe is a captcha a human can solve, t=bv is a hard block ("Access is
     // temporarily restricted") that nobody can solve - stop at once instead of waiting.
-    const frameSrc = await page.$eval(CAPTCHA_FRAME, f => f.src).catch(() => '');
-    if (/[?&]t=bv\b/.test(frameSrc)) {
-        await alertOperator('ip_blocked', { playerId, note: 'Shop temporarily blocked this IP. Pause orders and wait before retrying.' });
-        throw new ShopError('Shop is temporarily restricting access. Please try again later.', 'IP_BLOCKED');
-    }
+    await sleep(2500);
+    if (await pageShowsBlock(page)) throw await ipBlocked(playerId);
 
     await alertOperator('captcha_required', { playerId, note: 'Solve the captcha in the Chrome window.' });
     await page.bringToFront().catch(() => {});
@@ -114,10 +129,15 @@ async function loginPlayer(page, playerId, opts) {
     let login = await submitPlayerId(page, playerId);
 
     if (login.status === 403 && login.data?.url?.includes('captcha')) {
-        await waitForHumanCaptcha(page, playerId);
+        await waitForHumanCaptcha(page, playerId, login.data.url);
         await human(800, 1500);
         await openShop(page, opts, playerId); // page state after a captcha is unknown - start the form fresh
         login = await submitPlayerId(page, playerId);
+    }
+    if (login.status === 403 && login.data?.url) {
+        // Still challenged after the wait: block, or the captcha was not really solved
+        if (isBlockUrl(login.data.url) || await pageShowsBlock(page)) throw await ipBlocked(playerId);
+        throw new ShopError('Shop still asks for verification. Please try again shortly.', 'CAPTCHA_REQUIRED');
     }
     if (login.status !== 200) {
         throw new ShopError(`Shop login failed (HTTP ${login.status})`, 'LOGIN_HTTP');
