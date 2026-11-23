@@ -9,15 +9,13 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 4000;
-const SECRET_KEY = process.env.RA_SECRET_KEY;
 
 app.use(express.json());
 
 const limiter = rateLimit({
     windowMs: 60 * 1000,
     max: 5,
-    message: { status: false, message: "Too many requests, please try again later." },
-    keyGenerator: (req) => req.header('RA-SECRET-KEY') || req.ip
+    message: { status: false, message: "Too many requests, please try again later." }
 });
 
 let transactionRunning = false;
@@ -43,13 +41,9 @@ app.get('/transactions/:uid', async (req, res) => {
 
 app.post("/topup", limiter, async (req, res) => {
     const { playerId, denom, type, voucherCode, webhook } = req.body;
-    const apiKey = req.header('RA-SECRET-KEY');
 
     if (!playerId || !denom || !voucherCode || !webhook || !isLinkValid(webhook)) {
         return res.status(400).json({ status: false, message: 'Invalid request parameters' });
-    }
-    if (!(apiKey === SECRET_KEY)) {
-        return res.status(403).json({ status: false, message: 'Invalid Secret Key' });
     }
 
     const uid = uuidv4();
