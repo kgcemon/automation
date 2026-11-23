@@ -19,13 +19,11 @@ async function runAutomation(url, denom, type, voucherCode, callback) {
         // Wait for and select payment denomination
         await page.waitForSelector('.payment-denom-button');
         const buttons = await page.$$('.payment-denom-button');
-        // UniPin currently shows 9 options:
-        // 0:25 1:50 2:115 3:240 4:610 5:1240 6:2530 Diamond, 7:Weekly, 8:Monthly
-        if (!buttons[denom]) {
-            await browser.close();
-            return callback({ message: `Invalid denom ${denom} (UniPin has ${buttons.length} options)` }, null);
+        if (buttons.length >= 10) {
+            await buttons[denom].click();
+        } else {
+            throw new Error('Payment denomination buttons not found.');
         }
-        await buttons[denom].click();
 
         await page.waitForNavigation();
 
