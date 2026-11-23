@@ -1,9 +1,4 @@
-const axios = require('axios');
-const https = require('https');
-const crypto = require('crypto');
-const { getSession, invalidateSession, SHOP_ORIGIN } = require('./session');
-
-const agent = new https.Agent({ keepAlive: true });
+const { getShopPage } = require('./session');
 
 // Defaults — every one can be overridden per request (see server.js) or via .env
 const DEFAULTS = {
@@ -13,66 +8,78 @@ const DEFAULTS = {
     playerRegion: process.env.PLAYER_REGION || 'BD', // set to '' to skip region check
 };
 
-function mergeSetCookies(jar, response) {
-    for (const line of response.headers['set-cookie'] || []) {
-        const [pair] = line.split(';');
-        const idx = pair.indexOf('=');
-        if (idx > 0) jar[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
-    }
-}
-
-function buildHeaders(session, jar, extra = {}) {
-    return {
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Content-Type': 'application/json',
-        'Cookie': Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; '),
-        'Origin': SHOP_ORIGIN,
-        'Referer': `${SHOP_ORIGIN}/app`,
-        'User-Agent': session.userAgent,
-        'X-Requested-With': 'XMLHttpRequest',
-        ...extra,
+/**
+ * Runs inside the shop page (browser context). Mirrors what the site does:
+ *   POST /api/auth/player_id_login  { app_id, login_id }
+ *   POST /api/shop/pay/init         with X-CSRF-Token = __csrf__ cookie
+ */
+async function inPageFlow({ playerId, opts }) {
+    const readCookie = (name) => {
+        const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+        return m ? decodeURIComponent(m[1]) : null;
     };
-}
+    const json = async (res) => {
+        const text = await res.text();
+        try { return { status: res.status, data: JSON.parse(text) }; }
+        catch { return { status: res.status, data: null, text: text.slice(0, 200) }; }
+    };
 
-async function requestPaymentLink(playerId, opts, session) {
-    const jar = { ...session.cookies }; // per-request copy; login adds session_key/__csrf__
-    const playerRes = await axios.post(
-        `${SHOP_ORIGIN}/api/auth/player_id_login`,
-        { app_id: opts.appId, login_id: String(playerId), app_server_id: 0 },
-        { headers: buildHeaders(session, jar), httpsAgent: agent }
-    );
-    mergeSetCookies(jar, playerRes);
-    const player = playerRes.data;
+    // Start clean so the previous customer's login doesn't leak into this one
+    await fetch('/api/auth/logout', { headers: { Accept: 'application/json' } }).catch(() => {});
 
-    if (!player.nickname) return { error: 'Invalid player ID' };
+    const login = await json(await fetch('/api/auth/player_id_login', {
+        method: 'POST',
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ app_id: opts.appId, login_id: String(playerId) }),
+    }));
+    if (login.status !== 200) return { httpError: login.status, step: 'login', detail: login.text || login.data };
+
+    const player = login.data || {};
+    if (!player.nickname) return { error: player.error || 'Invalid player ID' };
     if (opts.playerRegion && player.region !== opts.playerRegion) {
         return { error: `Player region ${player.region} not allowed` };
     }
 
-    if (!jar.__csrf__) return { error: 'No __csrf__ cookie returned by player login' };
+    const randomToken = (bytes) => [...crypto.getRandomValues(new Uint8Array(bytes))]
+        .map(b => b.toString(16).padStart(2, '0')).join('');
 
-    const payRes = await axios.post(
-        `${SHOP_ORIGIN}/api/shop/pay/init?language=en&region=${encodeURIComponent(opts.shopRegion)}`,
-        {
+    // Double-submit CSRF: the shop frontend generates __csrf__ itself and sends
+    // the same value as X-CSRF-Token. The server does not issue it.
+    let csrf = readCookie('__csrf__');
+    if (!csrf) {
+        csrf = randomToken(16);
+        document.cookie = `__csrf__=${csrf}; path=/; secure; samesite=lax`;
+    }
+
+    const sessionId = randomToken(16);
+
+    const pay = await json(await fetch(
+        `/api/shop/pay/init?language=en&region=${encodeURIComponent(opts.shopRegion)}`, {
+        method: 'POST',
+        headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': csrf,
+        },
+        body: JSON.stringify({
             service: 'pc',
             app_id: opts.appId,
             packed_role_id: 0,
             channel_id: opts.channelId,
             channel_data: { payment_channel: null, need_return: true, invoice: [] },
             revamp_experiment: {
-                session_id: crypto.randomBytes(16).toString('hex'),
+                session_id: sessionId,
                 group: 'control2',
                 service_version: 'payment_center_frontend_20240611',
                 source: 'pc',
-                domain: new URL(SHOP_ORIGIN).host,
+                domain: location.host,
             },
-        },
-        { headers: buildHeaders(session, jar, { 'X-CSRF-Token': jar.__csrf__ }), httpsAgent: agent }
-    );
+        }),
+    }));
+    if (pay.status !== 200) return { httpError: pay.status, step: 'pay/init', detail: pay.text || pay.data };
 
-    const url = payRes.data?.init?.url;
-    if (!url) return { error: 'Failed to initiate payment' };
+    const url = pay.data?.init?.url;
+    if (!url) return { error: pay.data?.error || 'Failed to initiate payment' };
     return { url, nickname: player.nickname };
 }
 
@@ -89,17 +96,18 @@ const paymentLink = async (playerId, options = {}) => {
 
     for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-            const session = await getSession({ forceRefresh: attempt > 1 });
-            const result = await requestPaymentLink(playerId, opts, session);
+            const page = await getShopPage({ forceRefresh: attempt > 1 });
+            const result = await page.evaluate(inPageFlow, { playerId, opts });
+
+            if (result.httpError) {
+                console.error(`paymentLink attempt ${attempt}: ${result.step} HTTP ${result.httpError}`, result.detail);
+                if (attempt === 1) continue; // reload the shop page and retry once
+                return `Shop returned HTTP ${result.httpError} at ${result.step}`;
+            }
             return result.url || result.error;
         } catch (error) {
-            const status = error.response?.status;
-            console.error(`paymentLink attempt ${attempt} failed:`, status || '', error.message);
-            // Expired/blocked session -> refresh cookies once and retry
-            if (attempt === 1 && (status === 401 || status === 403 || status === 419)) {
-                invalidateSession();
-                continue;
-            }
+            console.error(`paymentLink attempt ${attempt} failed:`, error.message);
+            if (attempt === 1) continue;
             return error.message;
         }
     }

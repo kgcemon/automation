@@ -5,52 +5,50 @@ const { executablePath } = require('puppeteer');
 puppeteer.use(StealthPlugin());
 
 const SHOP_ORIGIN = process.env.SHOP_ORIGIN || 'https://shop.garena.my';
-const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 20 * 60 * 1000);
+const PAGE_TTL_MS = Number(process.env.SESSION_TTL_MS || 20 * 60 * 1000);
 
-let cached = null;      // { cookies, userAgent, createdAt }
-let pending = null;     // in-flight refresh promise (avoid parallel browser launches)
+let browser = null;
+let page = null;
+let pageCreatedAt = 0;
+let pending = null;
 
-async function fetchFreshSession() {
-    const browser = await puppeteer.launch({
-        headless: true,
-        executablePath: executablePath(),
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    });
-    try {
-        const page = await browser.newPage();
-        await page.goto(`${SHOP_ORIGIN}/app`, { timeout: 60000, waitUntil: 'networkidle2' });
-
-        const cookies = await page.cookies();
-        const userAgent = await page.evaluate(() => navigator.userAgent);
-        if (!cookies.some(c => c.name === 'datadome')) {
-            throw new Error('Could not obtain session cookies from shop page');
-        }
-
-        // __csrf__ / session_key are issued later by the player login response
-        return {
-            cookies: Object.fromEntries(cookies.map(c => [c.name, c.value])),
-            userAgent,
-            createdAt: Date.now(),
-        };
-    } finally {
-        await browser.close();
+async function openShopPage() {
+    if (!browser || !browser.connected) {
+        browser = await puppeteer.launch({
+            headless: true,
+            executablePath: executablePath(),
+            args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        });
     }
+    if (page && !page.isClosed()) await page.close().catch(() => {});
+
+    page = await browser.newPage();
+    await page.goto(`${SHOP_ORIGIN}/app`, { timeout: 60000, waitUntil: 'networkidle2' });
+    pageCreatedAt = Date.now();
+    return page;
 }
 
-async function getSession({ forceRefresh = false } = {}) {
-    const expired = !cached || Date.now() - cached.createdAt > SESSION_TTL_MS;
-    if (!forceRefresh && !expired) return cached;
+/**
+ * Returns a live page sitting on the shop origin. API calls are made from
+ * inside this page with fetch(), so cookies / CSRF are handled by the browser
+ * exactly as when a person uses the site.
+ */
+async function getShopPage({ forceRefresh = false } = {}) {
+    const stale = !page || page.isClosed() || Date.now() - pageCreatedAt > PAGE_TTL_MS;
+    if (!forceRefresh && !stale) return page;
 
     if (!pending) {
-        pending = fetchFreshSession()
-            .then(s => (cached = s))
-            .finally(() => { pending = null; });
+        pending = openShopPage().finally(() => { pending = null; });
     }
     return pending;
 }
 
-function invalidateSession() {
-    cached = null;
+async function closeBrowser() {
+    if (browser) await browser.close().catch(() => {});
+    browser = null;
+    page = null;
 }
 
-module.exports = { getSession, invalidateSession, SHOP_ORIGIN };
+process.on('exit', () => { if (browser) browser.process()?.kill(); });
+
+module.exports = { getShopPage, closeBrowser, SHOP_ORIGIN };
