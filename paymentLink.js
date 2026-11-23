@@ -10,7 +10,7 @@ const paymentLink = async (playerId) => {
     try {
         const playerUrl = 'https://shop.garena.my/api/auth/player_id_login';
         const playerPostFields = {
-            app_id: 100067,
+            app_id: 202953,
             login_id: playerId,
             app_server_id: 0
         };
@@ -18,7 +18,7 @@ const paymentLink = async (playerId) => {
             'Accept-Language': 'en-US,en;q=0.9',
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
-            'Cookie': 'source=pc; mspid2=23b79d8125f5d8ad091c745a0d28fc05; _ga=GA1.2.1526106606.1721112559; _gid=GA1.2.1406809970.1721112561; session_key=cs8kp6w6nasib8qle25wdk1m6or5dkb1; datadome=p9~L6eqQcvvFfaMp4ZJdJ7~nehAlDMS45slODUxjnAT~tdSm6UUQU6V9WxfSABNVZVUQLOIV889OYVz6DXBh6UIm8jeailbgL5z2ZDzpFz~pAMUx5dOKyk0675bTqUyT; __csrf__=ZTRZ38n7xT4jbYgpZpp6Rc5obiUZtcpd; _ga_76GMJR9HMM=GS1.1.1721112559.1.1.1721112624.0.0.0',
+            'Cookie': 'source=pc; mspid2=23b79d8125f5d8ad091c745a0d28fc05; _ga=GA1.2.1526106606.1721112559; _gid=GA1.2.1406809970.1721112561; session_key=cs8kp6w6nasib8qle25wdk1m6or5dkb1; datadome=Bc4Ha7Y2fBB7r1VyGDE~SiYygDPqNUNAaiG8EUR9SnpNGPnQXwZbKX2_l9kaLEc1U3lacCioiJWECRAk5msKfT3jMOrgXwVnIskIwKkkdfiyyTCk4DqxGXyoN~nZFgAT; __csrf__=UZJ2gMIhHPMAOSnCpWIv9y1Ojlv0aYYs; _ga_76GMJR9HMM=GS1.1.1721112559.1.1.1721112624.0.0.0',
             'DNT': '1',
             'Origin': 'https://shop.garena.my',
             'Pragma': 'no-cache',
@@ -35,7 +35,7 @@ const paymentLink = async (playerId) => {
             'sec-ch-ua': '"Chromium";v="92", " Not A;Brand";v="99"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Windows"',
-            'x-datadome-clientid': 'p9~L6eqQcvvFfaMp4ZJdJ7~nehAlDMS45slODUxjnAT~tdSm6UUQU6V9WxfSABNVZVUQLOIV889OYVz6DXBh6UIm8jeailbgL5z2ZDzpFz~pAMUx5dOKyk0675bTqUyT',
+            'x-datadome-clientid': 'Bc4Ha7Y2fBB7r1VyGDE~SiYygDPqNUNAaiG8EUR9SnpNGPnQXwZbKX2_l9kaLEc1U3lacCioiJWECRAk5msKfT3jMOrgXwVnIskIwKkkdfiyyTCk4DqxGXyoN~nZFgAT',
         };
 
         const playerResponse = await axios.post(playerUrl, playerPostFields, { headers: playerHeaders, httpsAgent: agent });
@@ -66,7 +66,7 @@ const paymentLink = async (playerId) => {
         };
         const paymentHeaders = {
             ...playerHeaders,
-            'X-CSRF-Token': 'ZTRZ38n7xT4jbYgpZpp6Rc5obiUZtcpd'
+            'X-CSRF-Token': 'UZJ2gMIhHPMAOSnCpWIv9y1Ojlv0aYYs'
         };
 
         const paymentResponse = await axios.post(paymentUrl, paymentPostFields, { headers: paymentHeaders, httpsAgent: agent });
